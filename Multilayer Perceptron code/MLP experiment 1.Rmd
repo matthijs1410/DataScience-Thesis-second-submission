@@ -1,0 +1,435 @@
+---
+title: "h2o mlp"
+author: "Matthijs Vervaeck"
+date: "2024-05-17"
+output: html_document
+---
+
+```{r libraries}
+library(h2o)
+library(rBayesianOptimization)
+library(pROC)
+h2o.init()
+
+```
+
+```{r unbalanced data add}
+trn_h2o <- as.h2o(trn_usfs)
+dev_h2o <- as.h2o(dev_usfs)
+tst_usfs_h2o <- as.h2o(tst_usfs)
+```
+
+```{r libraries}
+y <- which(names(trn_h2o) == "action_taken")
+x <- setdiff(names(trn_h2o), y)
+folds <- 5
+```
+
+```{r fitting default MLP}
+default_mlp <- h2o.deeplearning(
+  y = y,
+  training_frame = trn_h2o,
+  validation_frame = dev_h2o,
+  activation = "Tanh",
+  loss = "CrossEntropy",
+  nfolds = folds,
+  seed = 69,
+  stopping_rounds = 5,
+  stopping_metric = "misclassification",
+  stopping_tolerance = 0.001)
+```
+
+```{r default mlp predicting}
+default_predictions_mlp <- h2o.predict(default_mlp, tst_usfs_h2o)
+default_metrics_mlp <- h2o.performance(default_mlp, tst_usfs_h2o)
+```
+
+```{r evaluating default MLP}
+threshold <- 0.5
+
+default_confusion_matrix_mlp <- h2o.confusionMatrix(default_metrics_mlp, thresholds = threshold)
+default_accuracy_mlp <- h2o.accuracy(default_metrics_mlp, thresholds = threshold)[[1]]
+default_precision_mlp <- h2o.precision(default_metrics_mlp, thresholds = threshold)[[1]]
+default_recall_mlp <- h2o.recall(default_metrics_mlp, thresholds = threshold)[[1]]
+default_auc_mlp <- h2o.auc(default_metrics_mlp)
+default_mcc_mlp <- h2o.mcc(default_metrics_mlp, thresholds = threshold)[[1]]
+
+default_fpr_mlp <- as.vector(h2o.fpr(default_metrics_mlp)[, "fpr"])
+default_tpr_mlp <- as.vector(h2o.tpr(default_metrics_mlp)[, "tpr"])
+default_roc_data_mlp <- data.frame(fpr = default_fpr_mlp, tpr = default_tpr_mlp)
+```
+
+```{r showing metrics}
+default_metrics_vector_mlp <- c(
+  Accuracy = default_accuracy_mlp,
+  Precision = default_precision_mlp,
+  Recall = default_recall_mlp,
+  AUC = default_auc_mlp,
+  MCC = default_mcc_mlp)
+```
+
+```{r libraries}
+print("Default MLP Model Metrics with Cross-Validation:")
+print(default_metrics_vector_mlp)
+print(default_confusion_matrix_mlp)
+```
+
+```{r tuning hyperparmaters}
+final_mlp <- function(hidden_layers, neurons_per_layer, epochs, learning_rate) {
+  hidden_layers <- as.integer(hidden_layers)
+  neurons_per_layer <- as.integer(neurons_per_layer)
+  epochs <- as.integer(epochs)
+  hidden <- rep(neurons_per_layer, hidden_layers)
+  
+  model <- tryCatch({
+    h2o.deeplearning(
+      y = y,
+      training_frame = trn_h2o,
+      validation_frame = dev_h2o,
+      activation = "Tanh",
+      loss = "CrossEntropy",
+      hidden = hidden,
+      epochs = epochs,
+      rate = learning_rate,
+      adaptive_rate = FALSE,
+      nfolds = 5,
+      seed = 69,
+      stopping_rounds = 5,
+      stopping_metric = "misclassification",
+      stopping_tolerance = 0.001
+    )
+  }, error = function(e) {
+    message("Error in h2o.deeplearning: ", e$message)
+    return(NULL)
+  })
+  
+  if (is.null(model)) {
+    return(list(Score = Inf))  # Penalize failed evaluations
+  } else {
+    perf <- h2o.performance(model, valid = TRUE)
+    accuracy <- tryCatch({
+      acc <- h2o.accuracy(perf, thresholds = 0.5)[[1]]
+      if (is.nan(acc) || is.infinite(acc)) {
+        message("Invalid accuracy value: ", acc)
+        acc <- 0
+      }
+      acc
+    }, error = function(e) {
+      message("Error in calculating accuracy: ", e$message)
+      return(0)  # Handle potential issues with calculating accuracy
+    })
+    return(list(Score = -accuracy, actual_accuracy = accuracy))  
+  }
+}
+```
+
+```{r setting hyperparameter bounds}
+bounds_mlp <- list(
+  hidden_layers = c(1L, 8L),  
+  epochs = c(10L, 50L),
+  neurons_per_layer = c(5L, 35L),
+  learning_rate = c(0.001, 0.01))
+```
+
+```{r performing hp tuning}
+tic()
+opt_results_mlp <- tryCatch({
+  BayesianOptimization(
+    FUN = final_mlp,
+    bounds = bounds_mlp,
+    init_points = 12,
+    n_iter = 10,
+    acq = "ucb",
+    kappa = 2.576,
+    eps = 0.1  # Small value added to diagonal for numerical stability
+  )
+}, error = function(e) {
+  message("Error in Bayesian Optimization: ", e$message)
+  return(NULL)
+})
+toc()
+```
+
+```{r save}
+save.image()
+```
+
+
+````{r optimal tuning results}
+cat("Optimization History:\n")
+print(opt_results_mlp$History)
+  
+# Extract the best parameters and accuracy from the history
+best_result_index_mlp <- which.min(opt_results_mlp$History$Value)
+best_result_mlp <- opt_results_mlp$History[best_result_index_mlp, ]
+  
+cat("\nBest Parameters (Highest Accuracy):\n")
+print(best_result_mlp)
+  
+cat("\nBest Accuracy:\n")
+print(-best_result_mlp$Value)  # Convert negative value back to positive
+  
+# Update opt_results$Best_Par to store the best parameters for clarity
+opt_results_mlp$Best_Par <- best_result_mlp[, c("hidden_layers", "epochs", "neurons_per_layer", "learning_rate")]
+  
+best_hidden_layers <- as.integer(best_result_mlp$hidden_layers)
+best_epochs <- as.integer(best_result_mlp$epochs)
+best_neurons_per_layer <- as.integer(best_result_mlp$neurons_per_layer)
+best_learning_rate <- best_result_mlp$learning_rate
+```
+  
+```{r fitting tuned MLP}
+tuned_mlp <- h2o.deeplearning(
+  y = y,
+  training_frame = trn_h2o,
+  activation = "Tanh",
+  loss = "CrossEntropy",
+  hidden = rep(best_neurons_per_layer, best_hidden_layers),
+  epochs = best_epochs,
+  rate = best_learning_rate,
+  nfolds = folds,
+  adaptive_rate = FALSE,
+  seed = 69,  
+  stopping_rounds = 5,
+  stopping_tolerance = 0.001)
+
+```
+
+```{r preddicting tuned MLP}
+tuned_predictions_mlp <- h2o.predict(tuned_mlp, tst_usfs_h2o)
+tuned_metrics_mlp <- h2o.performance(tuned_mlp, tst_usfs_h2o)
+```
+
+```{r evaluating tuned MLP}
+tuned_confusion_matrix_mlp <- h2o.confusionMatrix(tuned_metrics_mlp, thresholds = threshold)
+tuned_accuracy_mlp <- h2o.accuracy(tuned_metrics_mlp, thresholds = threshold)[[1]]
+tuned_precision_mlp <- h2o.precision(tuned_metrics_mlp, thresholds = threshold)[[1]]
+tuned_recall_mlp <- h2o.recall(tuned_metrics_mlp, thresholds = threshold)[[1]]
+tuned_auc_mlp <- h2o.auc(tuned_metrics_mlp)
+tuned_mcc_mlp <- h2o.mcc(tuned_metrics_mlp, thresholds = threshold)[[1]]
+
+final_fpr_mlp <- as.vector(h2o.fpr(tuned_metrics_mlp)[, "fpr"])
+final_tpr_mlp <- as.vector(h2o.tpr(tuned_metrics_mlp)[, "tpr"])
+final_roc_data_mlp <- data.frame(fpr = final_fpr_mlp, tpr = final_tpr_mlp)
+```
+
+```{r final model metrics}
+final_metrics_vector_mlp <- c(
+  Accuracy = tuned_accuracy_mlp,
+  Precision = tuned_precision_mlp,
+  Recall = tuned_recall_mlp,
+  AUC = tuned_auc_mlp,
+  MCC = tuned_mcc_mlp)
+```
+
+```{r eval metrics tuned model}
+print("Tuned MLP Model Metrics:")
+print(final_metrics_vector_mlp)
+print(tuned_confusion_matrix_mlp)
+```
+
+```{r plotting ROC curves}
+roc_curve_default_mlp <- default_roc_data_mlp %>%
+  ggplot(aes(x = fpr, y = tpr)) +
+  geom_path(colour = "green", size = 1.5) +
+  geom_abline(intercept = 0, slope = 1, colour = "darkred", linetype = "dotted", size = 1.5) +
+  coord_equal() +
+  theme_light() +
+  labs(
+    title = "Default MLP ROC Curve",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)")
+
+roc_curve_final_mlp <- final_roc_data_mlp %>%
+  ggplot(aes(x = fpr, y = tpr)) +
+  geom_path(colour = "darkorange", size = 1.5) +
+  geom_abline(intercept = 0, slope = 1, colour = "darkred", linetype = "dotted", size = 1.5) +
+  coord_equal() +
+  theme_light() +
+  labs(
+    title = "Multilayer Perceptron unbalanced ROC Curve",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)")
+
+print(roc_curve_default_mlp)
+print(roc_curve_final_mlp)
+
+```
+
+```{r}
+smote_trn_h2o <- as.h2o(smote_trn)
+smote_dev_h2o <- as.h2o(smote_dev)
+```
+
+```{r}
+y1 <- which(names(smote_trn_h2o) == "action_taken")
+x1 <- setdiff(names(smote_trn_h2o), y1)
+```
+
+```{r}
+final_mlp_smote <- function(hidden_layers, neurons_per_layer, epochs, learning_rate) {
+  hidden_layers <- as.integer(hidden_layers)
+  neurons_per_layer <- as.integer(neurons_per_layer)
+  epochs <- as.integer(epochs)
+  hidden <- rep(neurons_per_layer, hidden_layers)
+  
+  model <- tryCatch({
+    h2o.deeplearning(
+      y = y1,
+      training_frame = smote_trn_h2o,
+      validation_frame = smote_dev_h2o,
+      activation = "Tanh",
+      loss = "CrossEntropy",
+      hidden = hidden,
+      epochs = epochs,
+      rate = learning_rate,
+      adaptive_rate = FALSE,
+      nfolds = 5,
+      seed = 69,
+      stopping_rounds = 5,
+      stopping_metric = "misclassification",
+      stopping_tolerance = 0.001
+    )
+  }, error = function(e) {
+    message("Error in h2o.deeplearning: ", e$message)
+    return(NULL)
+  })
+  
+  if (is.null(model)) {
+    return(list(Score = Inf))  # Penalize failed evaluations
+  } else {
+    perf <- h2o.performance(model, valid = TRUE)
+    accuracy <- tryCatch({
+      acc <- h2o.accuracy(perf, thresholds = 0.5)[[1]]
+      if (is.nan(acc) || is.infinite(acc)) {
+        message("Invalid accuracy value: ", acc)
+        acc <- 0
+      }
+      acc
+    }, error = function(e) {
+      message("Error in calculating accuracy: ", e$message)
+      return(0)  # Handle potential issues with calculating accuracy
+    })
+    return(list(Score = -accuracy, actual_accuracy = accuracy))  
+  }
+}
+
+```
+
+```{r}
+bounds_mlp_smote <- list(
+  hidden_layers = c(1L, 8L),  
+  epochs = c(10L, 50L),
+  neurons_per_layer = c(5L, 35L),
+  learning_rate = c(0.001, 0.01))
+```
+
+```{r}
+tic()
+opt_results_mlp_smote <- tryCatch({
+  BayesianOptimization(
+    FUN = final_mlp_smote,
+    bounds = bounds_mlp_smote,
+    init_points = 12,
+    n_iter = 10,
+    acq = "ucb",
+    kappa = 2.576,
+    eps = 0.1  # Small value added to diagonal for numerical stability
+  )
+}, error = function(e) {
+  message("Error in Bayesian Optimization: ", e$message)
+  return(NULL)
+})
+toc()
+```
+
+```{r}
+cat("Optimization History (SMOTE):\n")
+print(opt_results_mlp_smote$History)
+
+best_result_index_mlp_smote <- which.min(opt_results_mlp_smote$History$Value)
+best_result_mlp_smote <- opt_results_mlp_smote$History[best_result_index_mlp_smote, ]
+
+cat("\nBest Parameters (Highest Accuracy) for SMOTE:\n")
+print(best_result_mlp_smote)
+
+cat("\nBest Accuracy for SMOTE:\n")
+print(-best_result_mlp_smote$Value)
+
+opt_results_mlp_smote$Best_Par <- best_result_mlp_smote[, c("hidden_layers", "epochs", "neurons_per_layer", "learning_rate")]
+
+best_hidden_layers_smote <- as.integer(best_result_mlp_smote$hidden_layers)
+best_epochs_smote <- as.integer(best_result_mlp_smote$epochs)
+best_neurons_per_layer_smote <- as.integer(best_result_mlp_smote$neurons_per_layer)
+best_learning_rate_smote <- best_result_mlp_smote$learning_rate
+```
+
+```{r}
+tuned_mlp_smote <- h2o.deeplearning(
+  y = y1,
+  training_frame = smote_trn_h2o,
+  activation = "Tanh",
+  loss = "CrossEntropy",
+  hidden = rep(best_neurons_per_layer_smote, best_hidden_layers_smote),
+  epochs = best_epochs_smote,
+  rate = best_learning_rate_smote,
+  nfolds = folds,
+  adaptive_rate = FALSE,
+  seed = 69,  
+  stopping_rounds = 5,
+  stopping_tolerance = 0.001)
+```
+
+```{r}
+tuned_predictions_mlp_smote <- h2o.predict(tuned_mlp_smote, tst_usfs_h2o)
+tuned_metrics_mlp_smote <- h2o.performance(tuned_mlp_smote, tst_usfs_h2o)
+```
+
+```{r}
+tuned_confusion_matrix_mlp_smote <- h2o.confusionMatrix(tuned_metrics_mlp_smote, thresholds = threshold)
+tuned_accuracy_mlp_smote <- h2o.accuracy(tuned_metrics_mlp_smote, thresholds = threshold)[[1]]
+tuned_precision_mlp_smote <- h2o.precision(tuned_metrics_mlp_smote, thresholds = threshold)[[1]]
+tuned_recall_mlp_smote <- h2o.recall(tuned_metrics_mlp_smote, thresholds = threshold)[[1]]
+tuned_auc_mlp_smote <- h2o.auc(tuned_metrics_mlp_smote)
+tuned_mcc_mlp_smote <- h2o.mcc(tuned_metrics_mlp_smote, thresholds = threshold)[[1]]
+
+final_fpr_mlp_smote <- as.vector(h2o.fpr(tuned_metrics_mlp_smote)[, "fpr"])
+final_tpr_mlp_smote <- as.vector(h2o.tpr(tuned_metrics_mlp_smote)[, "tpr"])
+final_roc_data_mlp_smote <- data.frame(fpr = final_fpr_mlp_smote, tpr = final_tpr_mlp_smote)
+
+```
+
+```{r}
+final_metrics_vector_mlp_smote <- c(
+  Accuracy = tuned_accuracy_mlp_smote,
+  Precision = tuned_precision_mlp_smote,
+  Recall = tuned_recall_mlp_smote,
+  AUC = tuned_auc_mlp_smote,
+  MCC = tuned_mcc_mlp_smote)
+```
+
+```{r}
+print("Tuned MLP Model Metrics (SMOTE):")
+print(final_metrics_vector_mlp_smote)
+print(tuned_confusion_matrix_mlp_smote)
+```
+
+```{r}
+roc_curve_final_mlp_smote <- final_roc_data_mlp_smote %>%
+  ggplot(aes(x = fpr, y = tpr)) +
+  geom_path(colour = "darkcyan", size = 1.5) +
+  geom_abline(intercept = 0, slope = 1, colour = "darkred", linetype = "dotted", size = 1.5) +
+  coord_equal() +
+  theme_light() +
+  labs(
+    title = "Tuned MLP SMOTE ROC Curve",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  )
+
+print(roc_curve_final_mlp_smote)
+
+```
+
+
+

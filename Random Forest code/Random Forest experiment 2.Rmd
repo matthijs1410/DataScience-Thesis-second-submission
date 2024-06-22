@@ -1,0 +1,228 @@
+---
+title: "RandomForest h2o"
+author: "Matthijs Vervaeck"
+date: "2024-05-19"
+output: html_document
+---
+
+```{r libraries}
+library(h2o)
+library(rBayesianOptimization)
+library(pROC)
+h2o.init()
+```
+
+```{r transforming data to h2o}
+trn_h2o <- as.h2o(smote_trn)
+dev_h2o <- as.h2o(smote_dev)
+tst_usfs_h2o <- as.h2o(tst_usfs)
+```
+
+```{r setting vars}
+y <- which(names(trn_h2o) == "action_taken")
+x <- setdiff(names(trn_h2o), y)
+folds <- 5
+```
+
+```{r default rf}
+default_rf <- h2o.randomForest(
+  y = y,
+  training_frame = trn_h2o,
+  validation_frame = dev_h2o,
+  ntrees = 50,
+  nfolds = folds,
+  seed = 69)
+```
+
+```{r predicting default rf}
+default_predictions_rf <- h2o.predict(default_rf, tst_usfs_h2o)
+default_metrics_rf <- h2o.performance(default_rf, tst_usfs_h2o)
+```
+
+```{r eval metric default rf}
+threshold <- 0.5
+
+default_confusion_matrix_rf <- h2o.confusionMatrix(default_metrics_rf, thresholds = threshold)
+default_accuracy_rf <- h2o.accuracy(default_metrics_rf, thresholds = threshold)[[1]]
+default_precision_rf <- h2o.precision(default_metrics_rf, thresholds = threshold)[[1]]
+default_recall_rf <- h2o.recall(default_metrics_rf, thresholds = threshold)[[1]]
+default_auc_rf <- h2o.auc(default_metrics_rf)
+default_mcc_rf <- h2o.mcc(default_metrics_rf, thresholds = threshold)[[1]]
+
+default_fpr_rf <- as.vector(h2o.fpr(default_metrics_rf)[, "fpr"])
+default_tpr_rf <- as.vector(h2o.tpr(default_metrics_rf)[, "tpr"])
+default_roc_data_rf <- data.frame(fpr = default_fpr_rf, tpr = default_tpr_rf)
+
+```
+
+```{r printing eval metrics default rf}
+default_metrics_vector_rf <- c(
+  Accuracy = default_accuracy_rf,
+  Precision = default_precision_rf,
+  Recall = default_recall_rf,
+  AUC = default_auc_rf,
+  MCC = default_mcc_rf)
+
+print("Default RF Model Metrics with Cross-Validation:")
+print(default_metrics_vector_rf)
+print(default_confusion_matrix_rf)
+```
+
+```{r tuning function}
+final_rf <- function(ntrees, max_depth, min_rows, mtries, sample_rate) {
+  message("Evaluating with parameters: ntrees = ", ntrees,
+          ", max_depth = ", max_depth,
+          ", min_rows = ", min_rows,
+          ", mtries = ", mtries,
+          ", sample_rate = ", sample_rate)
+  
+  tryCatch({
+    model <- h2o.randomForest(
+      y = y,
+      training_frame = trn_h2o,
+      validation_frame = dev_h2o,
+      ntrees = as.integer(ntrees),
+      max_depth = as.integer(max_depth),
+      min_rows = as.integer(min_rows),
+      mtries = as.integer(mtries),
+      sample_rate = sample_rate,
+      seed = 69
+    )
+    
+    perf <- h2o.performance(model, valid = TRUE)
+    accuracy <- h2o.accuracy(perf, thresholds = 0.5)[[1]]
+    
+    if (is.na(accuracy) || is.infinite(accuracy)) {
+      message("Invalid accuracy value detected: ", accuracy)
+      return(list(Score = Inf))  # Penalize invalid performance metrics
+    }
+    
+    return(list(Score = -accuracy, actual_accuracy = accuracy))
+  }, error = function(e) {
+    message("Error in h2o.randomForest: ", e$message)
+    return(list(Score = Inf))  # Penalize failed evaluations
+  })
+}
+
+```
+
+```{r setting bounds for tuning}
+bounds_rf <- list(
+  ntrees = c(50, 200),
+  max_depth = c(5, 50),
+  min_rows = c(1, 20),
+  mtries = c(1, min(length(x) - 1, 20)),  # Ensure mtries is in the valid range [1, total_features - 1] and not too large
+  sample_rate = c(0.5, 1.0)
+)
+
+```
+
+```{r bayesian optimization function}
+tic()
+opt_results_rf <- BayesianOptimization(
+  FUN = final_rf,
+  bounds = bounds_rf,
+  init_points = 12,
+  n_iter = 20,
+  acq = "ucb")
+opt_results_rf
+toc()
+```
+
+```{r save}
+save.image()
+```
+
+```{r printing optimization results}
+cat("Optimization History:\n")
+print(opt_results_rf$History)
+
+best_result_index_rf <- which.min(opt_results_rf$History$Value)
+best_result_rf <- opt_results_rf$History[best_result_index_rf, ]
+
+cat("\nBest Parameters (Highest Accuracy):\n")
+print(best_result_rf)
+
+cat("\nBest Accuracy:\n")
+print(-best_result_rf$Value)
+
+opt_results_rf$Best_Par <- best_result_rf[, c("ntrees", "max_depth", "min_rows",  "sample_rate")]
+
+best_ntrees <- as.integer(best_result_rf$ntrees)
+best_max_depth <- as.integer(best_result_rf$max_depth)
+best_min_rows <- as.integer(best_result_rf$min_rows)
+best_mtries <- as.integer(best_result_rf$mtries)
+best_sample_rate <- best_result_rf$sample_rate
+```
+
+```{r tuned rf}
+tuned_rf <- h2o.randomForest(
+  y = y,
+  training_frame = trn_h2o,
+  validation_frame = dev_h2o,
+  ntrees = best_ntrees,
+  max_depth = best_max_depth,
+  min_rows = best_min_rows,
+    mtries = best_mtries,
+  sample_rate = best_sample_rate,
+  nfolds = folds,
+  seed = 69)
+```
+
+```{r predicting tuned rf}
+tuned_predictions_rf <- h2o.predict(tuned_rf, tst_usfs_h2o)
+tuned_metrics_rf <- h2o.performance(tuned_rf, tst_usfs_h2o)
+```
+
+```{r eval metrics tuned rf}
+tuned_confusion_matrix_rf <- h2o.confusionMatrix(tuned_metrics_rf, thresholds = threshold)
+tuned_accuracy_rf <- h2o.accuracy(tuned_metrics_rf, thresholds = threshold)[[1]]
+tuned_precision_rf <- h2o.precision(tuned_metrics_rf, thresholds = threshold)[[1]]
+tuned_recall_rf <- h2o.recall(tuned_metrics_rf, thresholds = threshold)[[1]]
+tuned_auc_rf <- h2o.auc(tuned_metrics_rf)
+tuned_mcc_rf <- h2o.mcc(tuned_metrics_rf, thresholds = threshold)[[1]]
+
+final_fpr_rf <- as.vector(h2o.fpr(tuned_metrics_rf)[, "fpr"])
+final_tpr_rf <- as.vector(h2o.tpr(tuned_metrics_rf)[, "tpr"])
+final_roc_data_rf <- data.frame(fpr = final_fpr_rf, tpr = final_tpr_rf)
+```
+
+```{r printing eval metric tuned rf}
+final_metrics_vector_rf <- c(
+  Accuracy = tuned_accuracy_rf,
+  Precision = tuned_precision_rf,
+  Recall = tuned_recall_rf,
+  AUC = tuned_auc_rf,
+  MCC = tuned_mcc_rf
+)
+
+print("Tuned RF Model Metrics:")
+print(final_metrics_vector_rf)
+print(tuned_confusion_matrix_rf)
+```
+
+```{r plotting roc curves of both rf}
+roc_curve_final_rf <- final_roc_data_rf %>%
+  ggplot(aes(x = fpr, y = tpr)) +
+  geom_path(colour = "darkblue", size = 1.5) +
+  geom_abline(intercept = 0, slope = 1, colour = "darkred", linetype = "dotted", size = 1.5) +
+  coord_equal() +
+  theme_light() +
+  labs(
+    title = "Random Forest + PCA ROC Curve",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  )
+
+print(roc_curve_final_rf)
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+

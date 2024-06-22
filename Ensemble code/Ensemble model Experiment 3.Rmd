@@ -1,0 +1,345 @@
+---
+title: "Ensemble 2"
+author: "Matthijs Vervaeck"
+date: "2024-05-19"
+output: html_document
+---
+
+```{r libraries}
+library(h2o)
+library(dplyr)
+library(ggplot2)
+library(yardstick)
+```
+
+```{r initialize h2o}
+h2o.init()
+```
+
+```{r lgr}
+smote_trn_h2o <- as.h2o(smote_trn)
+smote_dev_h2o <- as.h2o(smote_dev)
+tst_usfs_h2o <- as.h2o(tst_usfs)
+```
+
+```{r folds}
+folds <- 5
+```
+
+```{r lgr}
+my_lr <- h2o.glm(
+  x = x,
+  y = y,
+  training_frame = smote_trn_h2o,
+  validation_frame = smote_dev_h2o,
+  family = "binomial",
+  nfolds = folds,
+  keep_cross_validation_predictions = TRUE,
+  seed = 69
+)
+```
+
+```{r rf}
+best_ntrees <- as.integer(best_result_rf$ntrees)
+best_max_depth <- as.integer(best_result_rf$max_depth)
+best_min_rows <- as.integer(best_result_rf$min_rows)
+best_mtries <- as.integer(best_result_rf$mtries)
+best_sample_rate <- best_result_rf$sample_rate
+
+my_rf <- h2o.randomForest(
+  x = x,
+  y = y,
+  training_frame = smote_trn_h2o,
+  validation_frame = smote_dev_h2o,
+  ntrees = best_ntrees,
+  max_depth = best_max_depth,
+  min_rows = best_min_rows,
+    mtries = best_mtries,
+  sample_rate = best_sample_rate,
+  keep_cross_validation_predictions = TRUE,
+  nfolds = folds,
+  seed = 69)
+
+```
+
+```{r mlp}
+best_hidden_layers <- as.integer(best_result_mlp$hidden_layers)
+best_epochs <- as.integer(best_result_mlp$epochs)
+best_neurons_per_layer <- as.integer(best_result_mlp$neurons_per_layer)
+best_learning_rate <- best_result_mlp$learning_rate
+
+my_mlp <- h2o.deeplearning(
+  x = x,
+  y = y,
+  training_frame = smote_trn_h2o,
+  activation = "Tanh",
+  loss = "CrossEntropy",
+  hidden = rep(best_neurons_per_layer, best_hidden_layers),
+  epochs = best_epochs,
+  rate = best_learning_rate,
+  nfolds = folds,
+  adaptive_rate = FALSE,
+  keep_cross_validation_predictions = TRUE,
+  seed = 69,  
+  stopping_rounds = 5,
+  stopping_tolerance = 0.001)
+
+```
+
+```{r ensemble}
+ensemble <- h2o.stackedEnsemble(
+  x = x,
+  y = y,
+  training_frame = smote_trn_h2o,
+  validation_frame = smote_dev_h2o,
+  base_models = list(my_lr, my_rf, my_mlp),
+  metalearner_algorithm = "drf"
+)
+```
+
+```{r evaluation function}
+evaluate_model <- function(model, model_name, test_data) {
+  predictions <- h2o.predict(model, test_data)
+  perf <- h2o.performance(model, newdata = test_data)
+  
+  auc <- h2o.auc(perf)
+  accuracy <- h2o.accuracy(perf, thresholds = 0.5)[[1]]
+  precision <- h2o.precision(perf, thresholds = 0.5)[[1]]
+  recall <- h2o.recall(perf, thresholds = 0.5)[[1]]
+  mcc <- h2o.mcc(perf, thresholds = 0.5)[[1]]
+  
+  # Confusion matrix
+  confusion_matrix <- h2o.confusionMatrix(perf, thresholds = 0.5)
+  
+  # ROC data
+  fpr <- as.vector(h2o.fpr(perf)[, "fpr"])
+  tpr <- as.vector(h2o.tpr(perf)[, "tpr"])
+  roc_data <- data.frame(fpr = fpr, tpr = tpr)
+  
+  # Plot ROC curve
+  roc_curve <- ggplot(roc_data, aes(x = fpr, y = tpr)) +
+    geom_path(colour = "darkorange", size = 1.5) +
+    geom_abline(intercept = 0, slope = 1, colour = "darkred", linetype = "dotted", size = 1.5) +
+    coord_equal() +
+    theme_light() +
+    labs(
+      title = paste(model_name, "Default Ensemble ROC Curve "),
+      x = "False Positive Rate (1 - Specificity)",
+      y = "True Positive Rate (Sensitivity)"
+    )
+  
+  list(
+    auc = auc,
+    accuracy = accuracy,
+    precision = precision,
+    recall = recall,
+    mcc = mcc,
+    confusion_matrix = confusion_matrix,
+    roc_curve = roc_curve
+  )
+}
+```
+
+```{r base learners prediction}
+results_ensemble <- evaluate_model(ensemble, "Ensemble", tst_usfs_h2o)
+```
+
+```{r results ensemble}
+cat("\nEnsemble AUC:", results_ensemble$auc, "\n")
+cat("Ensemble Accuracy:", results_ensemble$accuracy, "\n")
+cat("Ensemble Precision:", results_ensemble$precision, "\n")
+cat("Ensemble Recall:", results_ensemble$recall, "\n")
+cat("Ensemble MCC:", results_ensemble$mcc, "\n")
+print(results_ensemble$confusion_matrix)
+print(results_ensemble$roc_curve)
+```
+
+```{r}
+untuned_lr <- h2o.glm(
+  x = x,
+  y = y,
+  training_frame = smote_trn_h2o,
+  validation_frame = smote_dev_h2o,
+  family = "binomial",
+  nfolds = folds,
+  keep_cross_validation_predictions = TRUE,
+  seed = 69)
+
+```
+
+```{r}
+untuned_rf <- h2o.randomForest(
+  x = x,
+  y = y,
+  training_frame = smote_trn_h2o,
+  validation_frame = smote_dev_h2o,
+  nfolds = folds,
+  keep_cross_validation_predictions = TRUE,
+  seed = 69)
+```
+
+```{r}
+untuned_mlp <- h2o.deeplearning(
+  x = x,
+  y = y,
+  training_frame = smote_trn_h2o,
+  validation_frame = smote_dev_h2o,
+  nfolds = folds,
+  keep_cross_validation_predictions = TRUE,
+  seed = 69)
+```
+
+```{r}
+untuned_ensemble <- h2o.stackedEnsemble(
+  x = x,
+  y = y,
+  training_frame = smote_trn_h2o,
+  validation_frame = smote_dev_h2o,
+  base_models = list(untuned_lr, untuned_rf, untuned_mlp),
+  metalearner_algorithm = "drf")
+
+```
+
+```{r}
+results_untuned_ensemble <- evaluate_model(untuned_ensemble, "Untuned Ensemble", tst_usfs_h2o)
+```
+
+```{r}
+cat("\nUntuned Ensemble AUC:", results_untuned_ensemble$auc, "\n")
+cat("Untuned Ensemble Accuracy:", results_untuned_ensemble$accuracy, "\n")
+cat("Untuned Ensemble Precision:", results_untuned_ensemble$precision, "\n")
+cat("Untuned Ensemble Recall:", results_untuned_ensemble$recall, "\n")
+cat("Untuned Ensemble MCC:", results_untuned_ensemble$mcc, "\n")
+print(results_untuned_ensemble$confusion_matrix)
+print(results_untuned_ensemble$roc_curve)
+```
+
+```{r default models for new data}
+default_lr2 <- h2o.glm(
+  x = x2,
+  y = y2,
+  training_frame = trn_h2o2,
+  validation_frame = dev_h2o2,
+  family = "binomial",
+  nfolds = folds,
+  keep_cross_validation_predictions = TRUE,
+  seed = 69
+)
+```
+
+```{r}
+best_result_rf2 <- opt_results_rf2$Best_Par
+best_ntrees2 <- as.integer(best_result_rf2$ntrees)
+best_max_depth2 <- as.integer(best_result_rf2$max_depth)
+best_min_rows2 <- as.integer(best_result_rf2$min_rows)
+best_mtries2 <- as.integer(best_result_rf2$mtries)
+best_sample_rate2 <- best_result_rf2$sample_rate
+```
+
+```{r}
+default_rf2 <- h2o.randomForest(
+  y = y2,
+  training_frame = trn_h2o2,
+  validation_frame = dev_h2o2,
+  ntrees = best_ntrees2,
+  max_depth = best_max_depth2,
+  min_rows = best_min_rows2,
+  mtries = best_mtries2,
+  sample_rate = best_sample_rate2,
+  keep_cross_validation_predictions = TRUE,
+  nfolds = folds,
+  seed = 69)
+```
+
+```{r}
+best_result_mlp2 <- opt_results_mlp2$Best_Par
+best_hidden_layers2 <- as.integer(best_result_mlp2$hidden_layers)
+best_epochs2 <- as.integer(best_result_mlp2$epochs)
+best_neurons_per_layer2 <- as.integer(best_result_mlp2$neurons_per_layer)
+best_learning_rate2 <- best_result_mlp2$learning_rate
+
+default_mlp2 <- h2o.deeplearning(
+  y = y2,
+  training_frame = trn_h2o2,
+  activation = "Tanh",
+  loss = "CrossEntropy",
+  hidden = rep(best_neurons_per_layer2, best_hidden_layers2),
+  epochs = best_epochs2,
+  rate = best_learning_rate2,
+  nfolds = folds,
+  adaptive_rate = FALSE,
+  keep_cross_validation_predictions = TRUE,
+  seed = 69,  
+  stopping_rounds = 5,
+  stopping_tolerance = 0.001
+)
+```
+
+```{r ensemble model2}
+ensemble2 <- h2o.stackedEnsemble(
+  x = x2,
+  y = y2,
+  training_frame = trn_h2o2,
+  validation_frame = dev_h2o2,
+  base_models = list(default_lr2, default_rf2, default_mlp2),
+  metalearner_algorithm = "drf"
+)
+
+```
+
+```{r}
+evaluate_model <- function(model, model_name, test_data) {
+  predictions <- h2o.predict(model, test_data)
+  perf <- h2o.performance(model, newdata = test_data)
+  
+  auc <- h2o.auc(perf)
+  accuracy <- h2o.accuracy(perf, thresholds = 0.5)[[1]]
+  precision <- h2o.precision(perf, thresholds = 0.5)[[1]]
+  recall <- h2o.recall(perf, thresholds = 0.5)[[1]]
+  mcc <- h2o.mcc(perf, thresholds = 0.5)[[1]]
+  
+  # Confusion matrix
+  confusion_matrix <- h2o.confusionMatrix(perf, thresholds = 0.5)
+  
+  # ROC data
+  fpr <- as.vector(h2o.fpr(perf)[, "fpr"])
+  tpr <- as.vector(h2o.tpr(perf)[, "tpr"])
+  roc_data <- data.frame(fpr = fpr, tpr = tpr)
+  
+  # Plot ROC curve
+  roc_curve <- ggplot(roc_data, aes(x = fpr, y = tpr)) +
+    geom_path(colour = "darkmagenta", size = 1.5) +
+    geom_abline(intercept = 0, slope = 1, colour = "darkred", linetype = "dotted", size = 1.5) +
+    coord_equal() +
+    theme_light() +
+    labs(
+      title = paste(model_name, "ROC Curve with Mahalanobis filtering"),
+      x = "False Positive Rate (1 - Specificity)",
+      y = "True Positive Rate (Sensitivity)"
+    )
+  
+  list(
+    auc = auc,
+    accuracy = accuracy,
+    precision = precision,
+    recall = recall,
+    mcc = mcc,
+    confusion_matrix = confusion_matrix,
+    roc_curve = roc_curve
+  )
+}
+```
+
+```{r}
+results_ensemble2 <- evaluate_model(ensemble2, "Ensemble", tst_usfs2)
+```
+
+```{r}
+cat("\nEnsemble AUC:", results_ensemble2$auc, "\n")
+cat("Ensemble Accuracy:", results_ensemble2$accuracy, "\n")
+cat("Ensemble Precision:", results_ensemble2$precision, "\n")
+cat("Ensemble Recall:", results_ensemble2$recall, "\n")
+cat("Ensemble MCC:", results_ensemble2$mcc, "\n")
+print(results_ensemble2$confusion_matrix)
+print(results_ensemble2$roc_curve)
+```

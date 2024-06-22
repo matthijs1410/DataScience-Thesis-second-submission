@@ -1,0 +1,88 @@
+---
+title: "Logistic Regression h2o"
+author: "Matthijs Vervaeck"
+date: "2024-05-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(h2o)
+library(rBayesianOptimization)
+library(pROC)
+library(ggplot2)
+h2o.init()
+```
+
+```{r transforming data}
+trn_h2o <- as.h2o(smote_trn)
+dev_h2o <- as.h2o(smote_dev)
+tst_usfs_h2o <- as.h2o(tst_usfs)
+```
+
+```{r setting vars}
+y <- which(names(trn_h2o) == "action_taken")
+x <- setdiff(names(trn_h2o), y)
+folds <- 5
+```
+
+```{r lgr model}
+default_lgr <- h2o.glm(
+  y = y,
+  training_frame = trn_h2o,
+  validation_frame = dev_h2o,
+  family = "binomial",
+  nfolds = folds,
+  seed = 69)
+```
+
+```{r predicting lgr}
+default_predictions_lgr <- h2o.predict(default_lgr, tst_usfs_h2o)
+default_metrics_lgr <- h2o.performance(default_lgr, tst_usfs_h2o)
+```
+
+```{r eval metrics lgr}
+threshold <- 0.5
+
+default_confusion_matrix_lgr <- h2o.confusionMatrix(default_metrics_lgr, thresholds = threshold)
+default_accuracy_lgr <- h2o.accuracy(default_metrics_lgr, thresholds = threshold)[[1]]
+default_precision_lgr <- h2o.precision(default_metrics_lgr, thresholds = threshold)[[1]]
+default_recall_lgr <- h2o.recall(default_metrics_lgr, thresholds = threshold)[[1]]
+default_auc_lgr <- h2o.auc(default_metrics_lgr)
+default_mcc_lgr <- h2o.mcc(default_metrics_lgr, thresholds = threshold)[[1]]
+
+default_fpr_lgr <- as.vector(h2o.fpr(default_metrics_lgr)[, "fpr"])
+default_tpr_lgr <- as.vector(h2o.tpr(default_metrics_lgr)[, "tpr"])
+default_roc_data_lgr <- data.frame(fpr = default_fpr_lgr, tpr = default_tpr_lgr)
+```
+
+```{r printing eval metrics lgr}
+default_metrics_vector_lgr <- c(
+  Accuracy = default_accuracy_lgr,
+  Precision = default_precision_lgr,
+  Recall = default_recall_lgr,
+  AUC = default_auc_lgr,
+  MCC = default_mcc_lgr
+)
+
+print("Default Logistic Regression Model Metrics with Cross-Validation:")
+print(default_metrics_vector_lgr)
+print(default_confusion_matrix_lgr)
+```
+
+```{r printing roc curve}
+roc_curve_default_lgr <- default_roc_data_lgr %>%
+  ggplot(aes(x = fpr, y = tpr)) +
+  geom_path(colour = "darkblue", size = 1.5) +
+  geom_abline(intercept = 0, slope = 1, colour = "darkred", linetype = "dotted", size = 1.5) +
+  coord_equal() +
+  theme_light() +
+  labs(
+    title = "Logistic Regression + PCA ROC Curve",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  )
+
+print(roc_curve_default_lgr)
+
+```
+
